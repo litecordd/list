@@ -1,0 +1,148 @@
+<?php
+declare(strict_types=1);
+
+$configPath = __DIR__ . '/config.php';
+if (!is_file($configPath)) {
+    header('Location: setup.php');
+    exit;
+}
+
+$GLOBALS['app_config_path'] = $configPath;
+$GLOBALS['app_config'] = require $configPath;
+$timezone = (string) ($GLOBALS['app_config']['app']['timezone'] ?? 'UTC');
+date_default_timezone_set($timezone);
+
+$updateLockPath = __DIR__ . '/.update/maintenance.lock';
+if (is_file($updateLockPath)) {
+    $updateLockAge = time() - (int) filemtime($updateLockPath);
+    if ($updateLockAge >= 0 && $updateLockAge < 600) {
+        http_response_code(503);
+        header('Retry-After: 30');
+        header('Content-Type: text/plain; charset=UTF-8');
+        echo 'The site is installing an update. Please try again in a moment.';
+        exit;
+    }
+    @unlink($updateLockPath);
+}
+
+if (!headers_sent()) {
+    header('X-Content-Type-Options: nosniff');
+    header('X-Frame-Options: DENY');
+    header('Referrer-Policy: strict-origin-when-cross-origin');
+    header('Permissions-Policy: camera=(), microphone=(), geolocation=()');
+    header_remove('X-Powered-By');
+
+    $requestIsHttps = (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+        || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https'
+        || (string) ($_SERVER['SERVER_PORT'] ?? '') === '443';
+    if ($requestIsHttps) {
+        header('Strict-Transport-Security: max-age=15552000; includeSubDomains');
+    }
+
+    if ((bool) ($GLOBALS['app_config']['security']['csp_enabled'] ?? true)) {
+        $frameSrc = [
+            "'self'",
+            'https://www.google.com',
+            'https://www.gstatic.com',
+            'https://www.youtube.com',
+            'https://player.twitch.tv',
+            'https://clips.twitch.tv',
+            'https://player.bilibili.com',
+            'https://player.vimeo.com',
+            'https://www.dailymotion.com',
+            'https://streamable.com',
+            'https://drive.google.com',
+            'https://discord.com',
+        ];
+
+        $widgetUrl = trim((string) ($GLOBALS['app_config']['discord']['server_widget_url'] ?? ''));
+        $widgetScheme = is_string(parse_url($widgetUrl, PHP_URL_SCHEME)) ? strtolower((string) parse_url($widgetUrl, PHP_URL_SCHEME)) : '';
+        $widgetHost = (string) (parse_url($widgetUrl, PHP_URL_HOST) ?: '');
+        if (in_array($widgetScheme, ['http', 'https'], true) && $widgetHost !== '' && !in_array($widgetHost, $frameSrc, true)) {
+            $frameSrc[] = 'https://' . $widgetHost;
+        }
+
+        $cspDirectives = [
+            "default-src 'self'",
+            "base-uri 'self'",
+            "object-src 'none'",
+            "frame-ancestors 'none'",
+            "form-action 'self'",
+            "script-src 'self' 'unsafe-inline' https://www.google.com https://www.gstatic.com",
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdnjs.cloudflare.com",
+            "font-src 'self' data: https://fonts.gstatic.com https://cdnjs.cloudflare.com",
+            "img-src 'self' data: https: http:",
+            "media-src 'self' https: http:",
+            'frame-src ' . implode(' ', $frameSrc),
+            "connect-src 'self' https://www.google.com https://www.gstatic.com",
+        ];
+        header('Content-Security-Policy: ' . implode('; ', $cspDirectives));
+    }
+}
+
+if (session_status() !== PHP_SESSION_ACTIVE) {
+    $sessionConfig = $GLOBALS['app_config'];
+    $securityConfig = is_array($sessionConfig['security'] ?? null) ? $sessionConfig['security'] : [];
+    $sessionBaseUrl = trim((string) ($sessionConfig['app']['base_url'] ?? ''), '/');
+    $sessionNamespace = trim((string) ($sessionConfig['app']['session_namespace'] ?? ''));
+    $sessionInstallPath = str_replace('\\', '/', (string) (realpath(__DIR__) ?: __DIR__));
+    $sessionSeed = $sessionNamespace !== ''
+        ? 'namespace:' . $sessionNamespace
+        : implode('|', [
+            'base:' . strtolower($sessionBaseUrl),
+            'public:' . strtolower(trim((string) ($sessionConfig['app']['public_url'] ?? ''))),
+            'path:' . strtolower($sessionInstallPath),
+        ]);
+
+    ini_set('session.use_strict_mode', '1');
+    session_name('DLSESSID' . substr(hash('sha256', $sessionSeed), 0, 16));
+
+    // Sessions persist until explicit logout instead of expiring when the browser closes.
+    $sessionLifetimeSeconds = 60 * 60 * 24 * 365;
+    ini_set('session.gc_maxlifetime', (string) $sessionLifetimeSeconds);
+
+    $cookieParams = session_get_cookie_params();
+    $cookieParams['lifetime'] = $sessionLifetimeSeconds;
+    $legacyCookiePath = $sessionBaseUrl === '' ? '/' : '/' . $sessionBaseUrl;
+    $cookieParams['path'] = '/';
+    $cookieParams['httponly'] = (bool) ($securityConfig['session_cookie_httponly'] ?? true);
+    $sameSite = (string) ($securityConfig['session_cookie_samesite'] ?? 'Lax');
+    $cookieParams['samesite'] = in_array($sameSite, ['Lax', 'Strict', 'None'], true) ? $sameSite : 'Lax';
+    if ((!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+        || strtolower((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '')) === 'https'
+        || (string) ($_SERVER['SERVER_PORT'] ?? '') === '443'
+        || (bool) ($securityConfig['session_cookie_secure'] ?? false)) {
+        $cookieParams['secure'] = true;
+    }
+    session_set_cookie_params($cookieParams);
+
+    session_start();
+
+    if ($legacyCookiePath !== '/' && isset($_COOKIE[session_name()]) && !headers_sent()) {
+        setcookie(session_name(), '', [
+            'expires' => time() - 3600,
+            'path' => $legacyCookiePath,
+            'secure' => (bool) ($cookieParams['secure'] ?? false),
+            'httponly' => (bool) ($cookieParams['httponly'] ?? true),
+            'samesite' => (string) ($cookieParams['samesite'] ?? 'Lax'),
+        ]);
+    }
+}
+
+require_once __DIR__ . '/includes/functions.php';
+require_once __DIR__ . '/includes/mailer.php';
+csrf_cookie_sync();
+
+if (isset($_GET['lang']) && is_string($_GET['lang']) && is_supported_language($_GET['lang'])) {
+    $_SESSION['language'] = $_GET['lang'];
+}
+if (isset($_GET['theme']) && is_string($_GET['theme']) && is_supported_theme($_GET['theme'])) {
+    $_SESSION['theme'] = $_GET['theme'];
+}
+
+require_once __DIR__ . '/includes/db.php';
+require_once __DIR__ . '/includes/schema_update.php';
+
+ensure_schema_updated_on_bootstrap();
+
+require_once __DIR__ . '/includes/layout.php';
