@@ -1,0 +1,149 @@
+<?php
+declare(strict_types=1);
+
+require dirname(__DIR__) . '/bootstrap.php';
+
+$nextRaw = trim((string) ($_GET['next'] ?? $_POST['next'] ?? ''));
+$hasNext = $nextRaw !== '';
+$nextPath = auth_next_path($nextRaw, 'index.php');
+
+if (is_logged_in()) {
+    redirect($hasNext ? $nextPath : 'index.php');
+}
+
+$username = '';
+$errors = [];
+$ipBanned = current_request_ip_banned();
+
+if ($ipBanned) {
+    $errors[] = t('auth.error_ip_banned');
+}
+
+if (method_is_post() && !$ipBanned) {
+    $username = normalize_username((string) ($_POST['username'] ?? ''));
+    $password = (string) ($_POST['password'] ?? '');
+
+    $loginIpBucket = 'login_ip:' . current_request_ip();
+    $loginUserBucket = 'login_user:' . current_request_ip() . ':' . strtolower($username);
+    $ipLockWait = rate_limit_seconds_remaining($loginIpBucket, 20, 300);
+    $userLockWait = $username !== '' ? rate_limit_seconds_remaining($loginUserBucket, 5, 300) : 0;
+    if ($ipLockWait > 0 || $userLockWait > 0) {
+        $errors[] = t('auth.login.error_locked', ['minutes' => (int) ceil(max($ipLockWait, $userLockWait) / 60)]);
+    }
+
+    if (!validate_csrf($_POST['_token'] ?? null)) {
+        $errors[] = t('auth.login.error_token');
+    }
+
+    if (!recaptcha_verify_response($_POST['g-recaptcha-response'] ?? null, (string) ($_SERVER['REMOTE_ADDR'] ?? ''), 'login')) {
+        $errors[] = t('common.recaptcha_failed');
+    }
+
+    if ($username === '' || $password === '') {
+        $errors[] = t('auth.login.error_required');
+    }
+
+    if ($errors === []) {
+        try {
+            $lockoutReady = users_has_login_lockout_columns();
+            $lockoutFields = $lockoutReady ? ', failed_login_attempts, login_locked_until' : '';
+            $emailFeaturesOn = email_features_enabled();
+            $verifyFields = ($emailFeaturesOn && users_has_email_verification_columns())
+                ? ', email, verify_token_hash'
+                : '';
+
+            $stmt = db()->prepare('SELECT id, username, ' . user_select_display_name_expression() . ', email, password_hash, role, created_at' . $lockoutFields . $verifyFields . '
+                                   FROM users
+                                   WHERE username = :username
+                                   LIMIT 1');
+            $stmt->execute([':username' => $username]);
+            $user = $stmt->fetch();
+
+            $lockSecondsRemaining = ($user !== false && $lockoutReady)
+                ? login_lock_seconds_remaining($user['login_locked_until'] ?? null)
+                : 0;
+
+            if ($lockSecondsRemaining > 0) {
+                $errors[] = t('auth.login.error_locked', ['minutes' => (int) ceil($lockSecondsRemaining / 60)]);
+            } elseif ($user === false || !password_verify($password, (string) $user['password_hash'])) {
+                rate_limit_record_failure($loginIpBucket, 20, 300);
+                rate_limit_record_failure($loginUserBucket, 5, 300);
+                if ($user !== false && $lockoutReady) {
+                    login_register_failed_attempt((int) $user['id'], (int) $user['failed_login_attempts']);
+                }
+                $errors[] = t('auth.login.error_invalid');
+            } else {
+                rate_limit_clear($loginIpBucket);
+                rate_limit_clear($loginUserBucket);
+                if ($lockoutReady) {
+                    login_clear_failed_attempts((int) $user['id']);
+                }
+
+                $pendingVerification = $emailFeaturesOn
+                    && users_has_email_verification_columns()
+                    && trim((string) ($user['email'] ?? '')) === ''
+                    && trim((string) ($user['verify_token_hash'] ?? '')) !== '';
+                if ($pendingVerification) {
+                    $errors[] = t('auth.login.error_unverified');
+                } else {
+                    login_user($user);
+                    flash('success', t('auth.login.welcome', ['name' => user_display_name_from_row($user)]));
+                    redirect($nextPath);
+                }
+            }
+        } catch (Throwable) {
+            $errors[] = t('auth.login.error_failed');
+        }
+    }
+}
+
+render_header(t('auth.login.title'), 'login');
+?>
+<section class="panel panel-narrow fade">
+    <div class="panel-head">
+        <h1><?= e(t('auth.login.heading')) ?></h1>
+        <p><?= e(t('auth.login.intro')) ?></p>
+    </div>
+
+    <?php if ($errors !== []): ?>
+        <div class="info-red"><?= e(implode(' ', $errors)) ?></div>
+    <?php endif; ?>
+
+    <?php if (!$ipBanned): ?>
+    <form class="stack-form" method="post" action="<?= e($hasNext ? base_url('login.php?next=' . rawurlencode($nextPath)) : base_url('login.php')) ?>">
+        <input type="hidden" name="_token" value="<?= e(csrf_token()) ?>">
+        <input type="hidden" name="next" value="<?= e($nextPath) ?>">
+
+        <label class="field">
+            <span><?= e(t('common.username')) ?></span>
+            <input type="text" name="username" value="<?= e($username) ?>" autocomplete="username" required>
+        </label>
+
+        <label class="field">
+            <span><?= e(t('common.password')) ?></span>
+            <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+
+        <?= recaptcha_widget_html('login') ?>
+
+        <button class="button blue hover" type="submit"><?= e(t('auth.login.button')) ?></button>
+    </form>
+    <?php endif; ?>
+
+    <?php if (!$ipBanned): ?>
+    <div class="auth-helper">
+        <p class="muted">
+            <?= e(t('auth.login.new_player')) ?>
+            <a class="link" href="<?= e($hasNext ? base_url('register.php?next=' . rawurlencode($nextPath)) : base_url('register.php')) ?>"><?= e(t('auth.login.create_account')) ?></a>
+        </p>
+        <?php if (email_features_enabled()): ?>
+        <div class="auth-helper-links">
+            <a class="link" href="<?= e(base_url('forgot.php?action=password')) ?>"><?= e(t('auth.login.link_forgot_password')) ?></a>
+            <a class="link" href="<?= e(base_url('forgot.php?action=username')) ?>"><?= e(t('auth.login.link_forgot_username')) ?></a>
+            <a class="link" href="<?= e(base_url('forgot.php?action=resend')) ?>"><?= e(t('auth.login.link_resend_verify')) ?></a>
+        </div>
+        <?php endif; ?>
+    </div>
+    <?php endif; ?>
+</section>
+<?php render_footer(); ?>
