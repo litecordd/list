@@ -4,14 +4,14 @@ declare(strict_types=1);
 // This file is only a reference. Open setup.php in the browser to generate config.php.
 return [
     'app' => [
-        'name' => 'My Demonlist',
+        'name' => 'Mario Demon List',
         'brand_mode' => 2, // 1 = text, 2 = logo
         'logo_path' => 'logo.png',
         'logo_height' => 22,
         'logo_max_width' => 130,
         'tagline' => 'A competitive Geometry Dash ranking platform.',
-        'author' => 'kacygd',
-        'base_url' => '/demonlist',
+        'author' => 'rainga',
+        'base_url' => '/list',
         'public_url' => '', // Optional absolute URL for embeds, e.g. https://your-domain.com/demonlist
         'timezone' => 'UTC',
         'default_language' => 'en',
